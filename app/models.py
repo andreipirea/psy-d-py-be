@@ -41,3 +41,31 @@ class Posts(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     deleted_at = Column(DateTime(timezone=True), nullable=True, default=None)
+
+
+class Comments(Base):
+    __tablename__ = "comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    user_name = Column(String, nullable=False)
+    parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True, index=True)
+    body = Column(Text, nullable=False)
+    image_url = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True, default=None)
+
+
+class CommentReactions(Base):
+    __tablename__ = "comment_reactions"
+    __table_args__ = (
+        Index("uq_comment_reaction", "comment_id", "user_id", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    comment_id = Column(Integer, ForeignKey("comments.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    reaction = Column(String(10), nullable=False)  # "like" or "dislike"
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

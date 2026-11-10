@@ -5,6 +5,7 @@ from typing import Annotated
 from app.routes.auth import router as auth_router, get_curent_user
 from app.routes.posts import router as posts_router
 from app.routes.contact import router as contact_router
+from app.routes.comments import router as comments_router
 import app.models as models
 from app.database import engine, SessionLocal
 from sqlalchemy.orm import Session
@@ -31,6 +32,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(posts_router)
 app.include_router(contact_router)
+app.include_router(comments_router)
 
 os.makedirs("uploads/images", exist_ok=True)
 app.mount("/uploads/images", StaticFiles(directory="uploads/images"), name="images")

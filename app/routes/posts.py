@@ -112,7 +112,7 @@ async def restore_post(post_id: int, user: admin_dependency, db: db_dependency):
 
 
 @router.get("/{post_id}", status_code=status.HTTP_200_OK)
-async def get_post(post_id: int, user: user_dependency, db: db_dependency):
+async def get_post(post_id: int, db: db_dependency):
     post = db.query(Posts).filter(Posts.id == post_id, Posts.deleted_at.is_(None)).first()
     if not post:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
