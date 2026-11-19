@@ -58,6 +58,18 @@ class Comments(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True, default=None)
 
 
+class CommentImages(Base):
+    """Photos attached to a comment (up to MAX_COMMENT_IMAGES each).
+    Comments.image_url is kept for comments created before multi-image support."""
+    __tablename__ = "comment_images"
+
+    id = Column(Integer, primary_key=True, index=True)
+    comment_id = Column(Integer, ForeignKey("comments.id"), nullable=False, index=True)
+    image_url = Column(Text, nullable=False)
+    position = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class CommentReactions(Base):
     __tablename__ = "comment_reactions"
     __table_args__ = (

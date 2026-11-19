@@ -6,9 +6,10 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from starlette import status
 from app.database import SessionLocal
-from app.models import Posts, Comments, CommentReactions, Users
+from app.models import Posts, Comments, CommentReactions, CommentImages, Users
 from app.routes.auth import get_curent_user
 
 router = APIRouter(prefix="/comments", tags=["comments"])
@@ -26,9 +27,16 @@ db_dependency = Annotated[Session, Depends(get_db)]
 user_dependency = Annotated[dict, Depends(get_curent_user)]
 
 
-def save_image(image: UploadFile) -> str:
+MAX_COMMENT_IMAGES = 5
+
+
+def validate_image(image: UploadFile) -> None:
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid image type")
+
+
+def save_image(image: UploadFile) -> str:
+    validate_image(image)
     file_extension = image.filename.split(".")[-1] if image.filename else "png"
     unique_filename = f"{uuid.uuid4()}.{file_extension}"
     file_path = os.path.join("uploads", "images", unique_filename)
@@ -56,8 +64,15 @@ admin_dependency = Annotated[dict, Depends(require_admin)]
 
 # ---------- Helpers ----------
 
-def _serialize_comment(comment: Comments, likes: int = 0, dislikes: int = 0) -> dict:
-    """Flat dict representation of a comment row."""
+def _serialize_comment(
+    comment: Comments,
+    likes: int = 0,
+    dislikes: int = 0,
+    images: Optional[list[str]] = None,
+) -> dict:
+    """Flat dict representation of a comment row.
+    ``image_urls`` merges the legacy single ``image_url`` with the comment_images rows."""
+    image_urls = ([comment.image_url] if comment.image_url else []) + (images or [])
     return {
         "id": comment.id,
         "post_id": comment.post_id,
@@ -66,6 +81,7 @@ def _serialize_comment(comment: Comments, likes: int = 0, dislikes: int = 0) -> 
         "parent_id": comment.parent_id,
         "body": comment.body,
         "image_url": comment.image_url,
+        "image_urls": image_urls,
         "likes_count": likes,
         "dislikes_count": dislikes,
         "created_at": comment.created_at,
@@ -73,16 +89,26 @@ def _serialize_comment(comment: Comments, likes: int = 0, dislikes: int = 0) -> 
     }
 
 
-def _build_comment_tree(flat_comments: list[Comments], counts: dict[int, dict]) -> list[dict]:
+def _build_comment_tree(
+    flat_comments: list[Comments],
+    counts: dict[int, dict],
+    images: dict[int, list[str]],
+) -> list[dict]:
     """Nest replies under their top-level parent. One level only.
-    ``counts`` maps comment_id → {"likes": int, "dislikes": int}."""
+    ``counts`` maps comment_id → {"likes": int, "dislikes": int};
+    ``images`` maps comment_id → ordered image paths."""
     lookup: dict[int, dict] = {}
     roots: list[dict] = []
 
     for c in flat_comments:
         c_counts = counts.get(c.id, {"likes": 0, "dislikes": 0})
         lookup[c.id] = {
-            **_serialize_comment(c, likes=c_counts["likes"], dislikes=c_counts["dislikes"]),
+            **_serialize_comment(
+                c,
+                likes=c_counts["likes"],
+                dislikes=c_counts["dislikes"],
+                images=images.get(c.id, []),
+            ),
             "replies": [],
         }
 
@@ -118,6 +144,31 @@ def _get_reaction_counts(db: Session, comment_ids: list[int]) -> dict[int, dict]
     return counts
 
 
+def _get_comment_images(db: Session, comment_ids: list[int]) -> dict[int, list[str]]:
+    """Bulk-fetch attached image paths for a list of comment ids, in upload order."""
+    if not comment_ids:
+        return {}
+    rows = (
+        db.query(CommentImages)
+        .filter(CommentImages.comment_id.in_(comment_ids))
+        .order_by(CommentImages.comment_id, CommentImages.position, CommentImages.id)
+        .all()
+    )
+    result: dict[int, list[str]] = {}
+    for row in rows:
+        result.setdefault(row.comment_id, []).append(row.image_url)
+    return result
+
+
+def _delete_comment_images(db: Session, comment: Comments) -> None:
+    """Remove a comment's image files (legacy + attached) and its comment_images rows."""
+    delete_image_file(comment.image_url)
+    rows = db.query(CommentImages).filter(CommentImages.comment_id == comment.id).all()
+    for row in rows:
+        delete_image_file(row.image_url)
+        db.delete(row)
+
+
 # ---------- Endpoints ----------
 
 @router.post("/post/{post_id}/new-comment", status_code=status.HTTP_201_CREATED)
@@ -125,10 +176,20 @@ async def create_comment(
     post_id: int,  # path param from the URL: /comments/post/{post_id}/new-comment
     body: str = Form(...),
     parent_id: Optional[int] = Form(None),
-    image: UploadFile = File(None),
+    images: Optional[list[UploadFile]] = File(None),
     user: user_dependency = None,
     db: db_dependency = None,
 ):
+    images = [img for img in (images or []) if img is not None and img.filename]
+    if len(images) > MAX_COMMENT_IMAGES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"A comment can have at most {MAX_COMMENT_IMAGES} images",
+        )
+    # Validate every file before writing any, so a bad one never leaves orphans on disk.
+    for img in images:
+        validate_image(img)
+
     # Validate the post exists and is not deleted.
     post = db.query(Posts).filter(Posts.id == post_id, Posts.deleted_at.is_(None)).first()
     if not post:
@@ -149,8 +210,6 @@ async def create_comment(
         if parent.parent_id is not None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot reply to a reply — only one level of nesting is allowed")
 
-    image_path = save_image(image) if image is not None else None
-
     # Fetch the user's name from the Users table.
     author = db.query(Users).filter(Users.id == int(user.get("id")), Users.deleted_at.is_(None)).first()
     if not author:
@@ -162,12 +221,26 @@ async def create_comment(
         user_name=author.name,
         parent_id=parent_id,
         body=body,
-        image_url=image_path,
+        image_url=None,
     )
     db.add(new_comment)
-    db.commit()
+    db.flush()  # assigns new_comment.id for the image rows
+
+    image_paths: list[str] = []
+    try:
+        for position, img in enumerate(images):
+            path = save_image(img)
+            image_paths.append(path)
+            db.add(CommentImages(comment_id=new_comment.id, image_url=path, position=position))
+        db.commit()
+    except Exception:
+        db.rollback()
+        for path in image_paths:
+            delete_image_file(path)
+        raise
+
     db.refresh(new_comment)
-    return {"comment": _serialize_comment(new_comment)}
+    return {"comment": _serialize_comment(new_comment, images=image_paths)}
 
 
 @router.get("/post/{post_id}", status_code=status.HTTP_200_OK)
@@ -183,8 +256,10 @@ async def get_post_comments(post_id: int, db: db_dependency):
         .order_by(Comments.created_at.asc())
         .all()
     )
-    counts = _get_reaction_counts(db, [c.id for c in comments])
-    return {"comments": _build_comment_tree(comments, counts)}
+    comment_ids = [c.id for c in comments]
+    counts = _get_reaction_counts(db, comment_ids)
+    images = _get_comment_images(db, comment_ids)
+    return {"comments": _build_comment_tree(comments, counts, images)}
 
 
 @router.delete("/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -195,7 +270,7 @@ async def delete_comment(comment_id: int, user: admin_dependency, db: db_depende
 
     now = datetime.now(timezone.utc)
     comment.deleted_at = now
-    delete_image_file(comment.image_url)
+    _delete_comment_images(db, comment)
 
     # Cascade: soft-delete direct replies, their images, and all reactions.
     replies = (
@@ -205,17 +280,47 @@ async def delete_comment(comment_id: int, user: admin_dependency, db: db_depende
     )
     for reply in replies:
         reply.deleted_at = now
-        delete_image_file(reply.image_url)
+        _delete_comment_images(db, reply)
 
+    # Reactions on the comment and on its replies.
+    reacted_ids = [comment_id] + [r.id for r in replies]
     db.query(CommentReactions).filter(
-        CommentReactions.comment_id == comment_id,
-    ).delete()
+        CommentReactions.comment_id.in_(reacted_ids),
+    ).delete(synchronize_session=False)
 
     db.commit()
     return {"message": "Comment deleted successfully"}
 
 
 VALID_REACTIONS = {"like", "dislike"}
+
+
+def _reaction_state(db: Session, comment_id: int, reaction: Optional[str]) -> dict:
+    """Fresh counts for one comment plus the caller's current reaction (None = no reaction)."""
+    counts = _get_reaction_counts(db, [comment_id]).get(comment_id, {"likes": 0, "dislikes": 0})
+    return {
+        "comment_id": comment_id,
+        "reaction": reaction,
+        "likes_count": counts["likes"],
+        "dislikes_count": counts["dislikes"],
+    }
+
+
+@router.get("/post/{post_id}/my-reactions", status_code=status.HTTP_200_OK)
+async def get_my_reactions(post_id: int, user: user_dependency, db: db_dependency):
+    """The logged-in user's reactions on a post's comments, as {comment_id: "like" | "dislike"}.
+    Kept separate from the public comment listing so that one stays cacheable and token-free."""
+    rows = (
+        db.query(CommentReactions.comment_id, CommentReactions.reaction)
+        .join(Comments, Comments.id == CommentReactions.comment_id)
+        .filter(
+            Comments.post_id == post_id,
+            Comments.deleted_at.is_(None),
+            CommentReactions.user_id == int(user.get("id")),
+        )
+        .all()
+    )
+    return {"reactions": {comment_id: reaction for comment_id, reaction in rows}}
 
 
 @router.post("/{comment_id}/react", status_code=status.HTTP_200_OK)
@@ -225,6 +330,8 @@ async def react_to_comment(
     user: user_dependency = None,
     db: db_dependency = None,
 ):
+    """Toggle a like/dislike. Same reaction again removes it; the other one flips it.
+    Returns the new counts and the caller's resulting reaction."""
     if reaction not in VALID_REACTIONS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="reaction must be 'like' or 'dislike'")
 
@@ -239,25 +346,27 @@ async def react_to_comment(
         .first()
     )
 
-    if existing:
-        if existing.reaction == reaction:
-            # Same reaction → remove it (toggle off).
-            db.delete(existing)
-            db.commit()
-            return {"message": "Reaction removed"}
-        else:
-            # Different reaction → flip it.
-            existing.reaction = reaction
-            db.commit()
-            db.refresh(existing)
-            return {"message": "Reaction updated", "reaction": existing.reaction}
+    if existing and existing.reaction == reaction:
+        db.delete(existing)
+        result: Optional[str] = None
+    elif existing:
+        existing.reaction = reaction
+        result = reaction
     else:
-        new_reaction = CommentReactions(
-            comment_id=comment_id,
-            user_id=user_id,
-            reaction=reaction,
-        )
-        db.add(new_reaction)
+        db.add(CommentReactions(comment_id=comment_id, user_id=user_id, reaction=reaction))
+        result = reaction
+
+    try:
         db.commit()
-        db.refresh(new_reaction)
-        return {"message": "Reaction added", "reaction": new_reaction.reaction}
+    except IntegrityError:
+        # A concurrent request (e.g. a double click) inserted the row first; the unique
+        # (comment_id, user_id) index rejected this one. Report what is actually stored.
+        db.rollback()
+        stored = (
+            db.query(CommentReactions.reaction)
+            .filter(CommentReactions.comment_id == comment_id, CommentReactions.user_id == user_id)
+            .scalar()
+        )
+        return _reaction_state(db, comment_id, stored)
+
+    return _reaction_state(db, comment_id, result)
